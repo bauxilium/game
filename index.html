@@ -3,28 +3,19 @@
 <head>
 <meta charset="utf-8">
 <title>Isopod</title>
-<link href="https://fonts.googleapis.com/css2?family=Silkscreen&display=swap" rel="stylesheet">
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   canvas { display: block; image-rendering: pixelated; }
-  #hint {
-    position: fixed; left: 0; right: 0; bottom: 32px;
-    text-align: center; color: #c9d6e3; opacity: 0.7;
-    font: 16px 'Silkscreen', monospace; letter-spacing: 1px;
-    pointer-events: none; transition: opacity 2s;
-  }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
-<div id="hint">WASD / arrow keys to crawl</div>
 <script>
 // =====================================================================
 //  SETUP
 // =====================================================================
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-const hint = document.getElementById('hint');
 
 // Pixel art trick: the game is drawn on a small, low-resolution canvas,
 // and the browser blows it up so every game pixel becomes a chunky block.
@@ -44,9 +35,10 @@ resize();
 
 const TAU = Math.PI * 2; // a full circle, in radians
 
-// Turn a colour like '#a1b2c3' into [red, green, blue, alpha] numbers
-function rgb(hex, alpha = 255) {
-  const n = parseInt(hex.slice(1), 16);
+// Turn a colour like '#a1b2c3' (or '#a1b2c380' for see-through) into [red, green, blue, alpha] numbers
+function rgb(hex) {
+  const n = parseInt(hex.slice(1, 7), 16);
+  const alpha = hex.length === 9 ? parseInt(hex.slice(7), 16) : 255;
   return [n >> 16, (n >> 8) & 255, n & 255, alpha];
 }
 
@@ -69,14 +61,93 @@ function turnToward(angle, target, amount) {
   return angle + diff * Math.min(1, amount);
 }
 
+function formatTime(seconds) {
+  return Math.floor(seconds / 60) + ':' + String(Math.floor(seconds % 60)).padStart(2, '0');
+}
+
+// =====================================================================
+//  TUNING: handy numbers to tweak how the game feels
+// =====================================================================
+const PLAYER_SPEED = 50;        // pixels per second
+const BASE_VISION = 87;         // how far you can see (in game pixels) when healthy
+const BODY_RADIUS = 7;          // isopods are treated as circles this big when bumping
+const EAT_RADIUS = 9;           // how close you need to be to eat something
+
+const MAX_HEALTH = 100;
+const MAX_HUNGER = 100;
+const START_HUNGER = 70;
+const HUNGER_DRAIN = 1.2;       // hunger lost per second
+const STARVE_DAMAGE = 3;        // health lost per second while your hunger is empty
+const WELL_FED = 60;            // while hunger is above this...
+const HEAL_RATE = 0.8;          // ...you heal this much health per second
+
+const SICK_PER_PLASTIC = 40;    // sickness from one bite of plastic (100 = as sick as it gets)
+const SICK_RECOVERY = 2.5;      // sickness that wears off per second
+const SICK_VISION_LOSS = 0.5;   // at full sickness you can only see half as far
+
+const FOOD_CHANCE = 0.35;       // chance of a food scrap in each 128x128 patch of seabed
+const PLASTIC_CHANCE = 0.3;     // chance of a piece of plastic in each patch
+
+const START_RIVALS = 3;         // how many rivals can be around at first...
+const MAX_RIVALS = 10;          // ...slowly growing to this many
+const MORE_RIVALS_EVERY = 30;   // seconds between each extra rival
+const SPAWN_EVERY = 3;          // seconds between new rivals turning up
+const BITE_DAMAGE = 8;
+const BITE_COOLDOWN = 0.7;      // seconds you're safe after being bitten
+const RIVAL_SMELL = 60;         // rivals go for food that's this close to them
+const GIVE_UP_DISTANCE = 450;   // rivals left this far behind wander off
+
 // =====================================================================
 //  KEYBOARD
 // =====================================================================
 const keys = {};
-addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+addEventListener('keydown', e => {
+  const key = e.key.toLowerCase();
+  keys[key] = true;
+  // After dying, Space / Enter / R starts a new game
+  if (state === 'dead' && deadTime > 0.8 && (key === ' ' || key === 'enter' || key === 'r')) resetGame();
+});
 addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
 // Don't keep walking if the window loses focus while a key is held
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+// =====================================================================
+//  PIXEL FONT
+//  A tiny 3x5 font so text matches the pixel art. Each character is
+//  5 rows of 3 pixels, written as 1 (filled) and 0 (empty).
+// =====================================================================
+const FONT = {
+  A: '010101111101101', B: '110101110101110', C: '011100100100011', D: '110101101101110',
+  E: '111100110100111', F: '111100110100100', G: '011100101101011', H: '101101111101101',
+  I: '111010010010111', J: '001001001101010', K: '101101110101101', L: '100100100100111',
+  M: '101111111101101', N: '110101101101101', O: '010101101101010', P: '110101110100100',
+  Q: '010101101110011', R: '110101110101101', S: '011100010001110', T: '111010010010010',
+  U: '101101101101111', V: '101101101101010', W: '101101111111101', X: '101101010101101',
+  Y: '101101010010010', Z: '111001010100111',
+  0: '111101101101111', 1: '010110010010111', 2: '110001010100111', 3: '110001010001110',
+  4: '101101111001001', 5: '111100110001110', 6: '011100111101111', 7: '111001010010010',
+  8: '111101111101111', 9: '111101111001110',
+  '+': '000010111010000', '-': '000000111000000', ':': '000010000010000', '!': '010010010000010',
+  '.': '000000000000010', '/': '001001010100100', ' ': '000000000000000',
+};
+
+function drawText(text, x, y, color, scale = 1) {
+  ctx.fillStyle = color;
+  for (const ch of text.toUpperCase()) {
+    const glyph = FONT[ch] || FONT[' '];
+    for (let i = 0; i < 15; i++) {
+      if (glyph[i] === '1') ctx.fillRect(x + (i % 3) * scale, y + Math.floor(i / 3) * scale, scale, scale);
+    }
+    x += 4 * scale;
+  }
+}
+
+// Text with a dark shadow so it's readable on top of anything
+function drawLabel(text, x, y, color, scale = 1, centered = false) {
+  if (centered) x -= Math.floor((text.length * 4 - 1) * scale / 2);
+  drawText(text, x + scale, y + scale, '#04060a', scale);
+  drawText(text, x, y, color, scale);
+}
 
 // =====================================================================
 //  ISOPOD SPRITES
@@ -265,14 +336,173 @@ const playerSprites = makeSprites(PLAYER_LOOK);
 const rivalSprites = makeSprites(RIVAL_LOOK);
 
 // =====================================================================
+//  FOOD, PLASTIC AND HUD ICONS
+//  Small hand-drawn pixel art: each letter is a colour from the palette
+//  underneath it, and '.' is see-through.
+// =====================================================================
+function pixelArt(rows, colors) {
+  const pal = {};
+  for (const k in colors) pal[k] = rgb(colors[k]);
+  const w = Math.max(...rows.map(r => r.length)) + 1, h = rows.length + 1; // +1 to fit the shadow
+  const filled = (x, y) => y >= 0 && y < rows.length && x >= 0 && x < rows[y].length && rows[y][x] !== '.';
+  const sprite = document.createElement('canvas');
+  sprite.width = w;
+  sprite.height = h;
+  const sctx = sprite.getContext('2d');
+  const img = sctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const c = filled(x, y) ? pal[rows[y][x]] : filled(x - 1, y - 1) ? SPRITE_SHADOW : null;
+      if (c) img.data.set(c, (y * w + x) * 4);
+    }
+  }
+  sctx.putImageData(img, 0, 0);
+  return sprite;
+}
+
+const ITEMS = {
+  // ---- Food: how much hunger each one fills ----
+  shrimp: {
+    food: 12,
+    art: [
+      '..oooo..a',
+      '.olllloa.',
+      'olppppeo.',
+      'olpoooo..',
+      'olpo.....',
+      'odpoooof.',
+      '.oddppff.',
+      '..ooooof.',
+    ],
+    colors: { o: '#4a1c16', l: '#ffb8a0', p: '#f07e62', d: '#c4543f', e: '#140806', a: '#f2a690', f: '#f6a58c' },
+  },
+  jelly: { // a dead moon jellyfish
+    food: 20,
+    art: [
+      '..ooooo..',
+      '.owwttto.',
+      'otggtggto',
+      'otgtttgto',
+      'ottttttto',
+      'otgtttgto',
+      'otggtggto',
+      '.ottttto.',
+      '..ooooo..',
+    ],
+    colors: { o: '#6d86a8', t: '#bfe3ff80', w: '#f4faffd0', g: '#f29ad8' },
+  },
+  fish: {
+    food: 35,
+    art: [
+      '...ooooo....oo',
+      '..oxlxlllo.ofo',
+      '.olmxmmmmmoffo',
+      'ommxmxmmmmmfo.',
+      '.odmmmmmmmoffo',
+      '..oddddddo.ofo',
+      '...ooooo....oo',
+    ],
+    colors: { o: '#1c2430', x: '#1c2430', l: '#e3eaf0', m: '#a9b8c6', d: '#70808f', f: '#c2cdd8' },
+  },
+
+  // ---- Plastic: NOT food. Eating it makes you sick. ----
+  cap: {
+    plastic: true,
+    art: [
+      '..ooo..',
+      '.olllo.',
+      'olcccro',
+      'olcccro',
+      'olcccro',
+      '.orrro.',
+      '..ooo..',
+    ],
+    colors: { o: '#0e1f3d', l: '#9fd0ff', c: '#4a90ea', r: '#2a5fb8' },
+  },
+  bag: { // looks a lot like a jellyfish...
+    plastic: true,
+    art: [
+      '.ooo.ooo.',
+      '.o.o.o.o.',
+      'ooooooooo',
+      'owwswwwwo',
+      'owswwswwo',
+      'owwwswwso',
+      'oswwwwwwo',
+      'owwswwwso',
+      '.ooooooo.',
+    ],
+    colors: { o: '#8a96a3', w: '#e6edf3c0', s: '#b4c0ccc0' },
+  },
+  bottle: {
+    plastic: true,
+    art: [
+      '.ooooooo....',
+      'owswwwwwoorr',
+      'owwbbbwwwwrr',
+      'owwwwwwwoorr',
+      '.ooooooo....',
+    ],
+    colors: { o: '#7e8a96', w: '#d8e6efb0', s: '#ffffffd0', b: '#5b8fc7', r: '#d8433a' },
+  },
+};
+for (const name in ITEMS) ITEMS[name].sprite = pixelArt(ITEMS[name].art, ITEMS[name].colors);
+
+// How common each kind is when food or plastic turns up
+const FOOD_KINDS = [['shrimp', 0.6], ['jelly', 0.28], ['fish', 0.12]];
+const PLASTIC_KINDS = [['cap', 0.4], ['bag', 0.35], ['bottle', 0.25]];
+
+function pickWeighted(kinds, r) {
+  for (const [name, chance] of kinds) {
+    if (r < chance) return name;
+    r -= chance;
+  }
+  return kinds[kinds.length - 1][0];
+}
+
+const ICONS = {
+  heart: pixelArt([
+    '.oo.oo.',
+    'owrorro',
+    'orrrrro',
+    '.orrro.',
+    '..oro..',
+    '...o...',
+  ], { o: '#2a0b12', r: '#e84a64', w: '#ffc2cc' }),
+  fish: pixelArt([
+    '....ooo..',
+    'oo.oyhyo.',
+    'oyoyyyyeo',
+    'oo.oyyyo.',
+    '....ooo..',
+  ], { o: '#2b1a08', y: '#f2a33a', h: '#ffd27a', e: '#2b1a08' }),
+  skull: pixelArt([
+    '.ooooo.',
+    'owwwwwo',
+    'oeeweeo',
+    'oeeweeo',
+    'owwewwo',
+    '.owwwo.',
+    '.owowo.',
+  ], { o: '#1d2a14', w: '#e4efd2', e: '#1d2a14' }),
+};
+
+// =====================================================================
 //  ENDLESS SEABED
 //  The world is split into square "chunks". A chunk is only created when
 //  it comes into view, so the seabed goes on forever. Each chunk is built
 //  from a seed, so a spot looks the same when you come back to it.
 // =====================================================================
-const CHUNK = 128;                              // chunk size in game pixels
-const SEED = Math.floor(Math.random() * 1e9);   // a different seabed every game
+const CHUNK = 128;           // chunk size in game pixels
+let SEED = 0;                // picked fresh every game, so every seabed is different
 const chunks = new Map();
+const eaten = new Set();     // food and plastic that's gone, so it doesn't grow back
+
+// A snack and a bottle cap right in front of you at the start, to show the difference
+const START_ITEMS = [
+  { type: 'shrimp', x: 0, y: -42 },
+  { type: 'cap', x: 38, y: -20 },
+];
 
 // A repeatable "random" number from 0 to 1 for any whole-number position
 function hash(x, y, salt) {
@@ -385,15 +615,35 @@ function makeChunk(cx, cy) {
   for (let i = 0; i < pebbles; i++) {
     stone(...spot(6), between(1, 3.5), between(0.65, 1), pickRock());
   }
-
   c.putImageData(img, 0, 0);
-  return { canvas, cx, cy };
+
+  // Food scraps and plastic litter lying around (kept separate from the
+  // picture of the seabed, because they can be eaten)
+  const items = [];
+  let count = 0;
+  const place = type => {
+    const [x, y] = spot(10);
+    const wx = cx * CHUNK + x, wy = cy * CHUNK + y;
+    const id = cx + ',' + cy + ',' + count++;
+    if (Math.hypot(wx, wy) > 30 && !eaten.has(id)) items.push({ id, type, x: wx, y: wy });
+  };
+  if (rand() < FOOD_CHANCE) place(pickWeighted(FOOD_KINDS, rand()));
+  if (rand() < FOOD_CHANCE * 0.3) place(pickWeighted(FOOD_KINDS, rand()));
+  if (rand() < PLASTIC_CHANCE) place(pickWeighted(PLASTIC_KINDS, rand()));
+  START_ITEMS.forEach((s, i) => {
+    const id = 'start' + i;
+    if (Math.floor(s.x / CHUNK) === cx && Math.floor(s.y / CHUNK) === cy && !eaten.has(id)) {
+      items.push({ id, type: s.type, x: s.x, y: s.y });
+    }
+  });
+
+  return { canvas, cx, cy, items };
 }
 
 function getChunk(cx, cy) {
   const key = cx + ',' + cy;
   if (!chunks.has(key)) chunks.set(key, makeChunk(cx, cy));
-  return chunks.get(key).canvas;
+  return chunks.get(key);
 }
 
 // Forget chunks far behind you so memory doesn't fill up
@@ -409,16 +659,18 @@ function forgetFarChunks() {
 // =====================================================================
 //  DARKNESS
 //  A dark layer with a hole around the player. The edge fades out in
-//  dithered steps for a pixel-art look. It's only rebuilt when the
-//  vision size changes.
+//  dithered steps for a pixel-art look, and turns murky green when you're
+//  sick. It's only rebuilt when your vision changes.
 // =====================================================================
 const DARK_STEPS = [0, 0.24, 0.48, 0.72, 0.96]; // see-through ... almost black
-const DARK_FILL = `rgba(0, 2, 8, ${Math.round(0.96 * 255) / 255})`;
-let darkMask = null, darkMaskRadius = -1;
+let darkMask = null, darkMaskKey = '', darkFill = '';
 
 function getDarkMask() {
   const r = Math.round(visionRadius);
-  if (r === darkMaskRadius) return darkMask;
+  const tint = Math.round(player.sick / 20) / 5; // 0 = healthy, 1 = very sick
+  const key = r + '/' + tint;
+  if (key === darkMaskKey) return darkMask;
+  const color = [Math.round(14 * tint), Math.round(2 + 30 * tint), Math.round(8 - 2 * tint)];
   const half = r + 1, size = half * 2;
   darkMask = document.createElement('canvas');
   darkMask.width = darkMask.height = size;
@@ -430,34 +682,53 @@ function getDarkMask() {
       const d = Math.hypot(x + 0.5 - half, y + 0.5 - half);
       const t = Math.min(1, Math.max(0, (d - inner) / (r - inner)));
       const step = Math.min(DARK_STEPS.length - 1, Math.floor(t * (DARK_STEPS.length - 1) + BAYER[y & 3][x & 3]));
-      img.data.set([0, 2, 8, Math.round(DARK_STEPS[step] * 255)], (y * size + x) * 4);
+      img.data.set([...color, Math.round(DARK_STEPS[step] * 255)], (y * size + x) * 4);
     }
   }
   mctx.putImageData(img, 0, 0);
-  darkMaskRadius = r;
+  darkFill = `rgba(${color.join(', ')}, ${Math.round(0.96 * 255) / 255})`;
+  darkMaskKey = key;
   return darkMask;
 }
 
 // =====================================================================
-//  THE PLAYER, RIVALS AND DRIFTING SNOW
-//  (all distances are in game pixels)
+//  GAME STATE
 // =====================================================================
-const player = {
-  x: 0, y: 0,
-  speed: 50,            // pixels per second
-  angle: -Math.PI / 2,  // facing up
-  walk: 0,              // drives the walking animation
-};
-
-// How far you can see. Getting sick will shrink this later.
-let visionRadius = 87;
-
-const BODY_RADIUS = 7;        // isopods are treated as circles this big when bumping
-const MAX_RIVALS = 25;
-const SPAWN_EVERY = 1.2;      // seconds between new rivals
-const GIVE_UP_DISTANCE = 450; // rivals left this far behind wander off
+const player = { x: 0, y: 0, angle: 0, walk: 0, health: 0, hunger: 0, sick: 0, hurtTimer: 0 };
 const rivals = [];
-let spawnTimer = 2;           // a short calm moment at the start
+const activeItems = []; // food and plastic near you
+const particles = [];   // crumbs when something gets eaten
+const floaters = [];    // floating "+12" style messages
+const scent = [];       // the smell drifting off food
+const CURRENT = { x: 7, y: -4 }; // the gentle current that carries scent along
+const SCENT_LIFE = 3;
+
+let visionRadius, state, deathCause, deadTime, time, foodEaten, plasticEaten;
+let spawnTimer, shake, displayHealth, hasMoved, hintTimer;
+let clock = 0; // keeps ticking even after you die, for animations
+
+function resetGame() {
+  SEED = Math.floor(Math.random() * 1e9); // a brand-new seabed
+  chunks.clear();
+  eaten.clear();
+  Object.assign(player, {
+    x: 0, y: 0, angle: -Math.PI / 2, walk: 0,
+    health: MAX_HEALTH, hunger: START_HUNGER, sick: 0, hurtTimer: 0,
+  });
+  for (const list of [rivals, activeItems, particles, floaters, scent]) list.length = 0;
+  visionRadius = BASE_VISION;
+  displayHealth = MAX_HEALTH;
+  state = 'playing';
+  deathCause = '';
+  deadTime = 0;
+  time = 0;
+  foodEaten = 0;
+  plasticEaten = 0;
+  spawnTimer = 4; // a calm moment at the start
+  shake = 0;
+  hasMoved = false;
+  hintTimer = 0;
+}
 
 function spawnRival() {
   // Appear somewhere in the darkness just beyond what you can see
@@ -470,6 +741,7 @@ function spawnRival() {
     speed: 28 + Math.random() * 12,     // a bit slower than you
     walk: Math.random() * WALK_FRAMES,
     wander: Math.random() * 100,        // so they don't all weave in sync
+    munching: 0,                        // seconds left eating a stolen snack
   });
 }
 
@@ -481,6 +753,69 @@ function pushApart(a, b, aShare) {
   const nx = dx / d, ny = dy / d;
   a.x -= nx * overlap * aShare;       a.y -= ny * overlap * aShare;
   b.x += nx * overlap * (1 - aShare); b.y += ny * overlap * (1 - aShare);
+}
+
+// Collect the food and plastic lying near you (on screen or just off it)
+function gatherItems() {
+  activeItems.length = 0;
+  const rx = Math.ceil(canvas.width / 2 / CHUNK) + 1, ry = Math.ceil(canvas.height / 2 / CHUNK) + 1;
+  const pcx = Math.floor(player.x / CHUNK), pcy = Math.floor(player.y / CHUNK);
+  for (let gy = pcy - ry; gy <= pcy + ry; gy++) {
+    for (let gx = pcx - rx; gx <= pcx + rx; gx++) {
+      for (const it of getChunk(gx, gy).items) if (!it.gone) activeItems.push(it);
+    }
+  }
+}
+
+function burst(x, y, colors, count) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * TAU, speed = 15 + Math.random() * 25;
+    particles.push({ x, y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, life: 0.3 + Math.random() * 0.4, color: colors[i % colors.length] });
+  }
+}
+
+function floatText(x, y, text, color) {
+  floaters.push({ x, y, text, color, life: 1 });
+}
+
+function removeItem(it) {
+  it.gone = true;
+  eaten.add(it.id);
+}
+
+function playerEats(it) {
+  const kind = ITEMS[it.type];
+  removeItem(it);
+  burst(it.x, it.y, Object.values(kind.colors), 10);
+  if (kind.plastic) {
+    player.sick = Math.min(100, player.sick + SICK_PER_PLASTIC);
+    plasticEaten++;
+    floatText(it.x, it.y - 8, 'BLEH!', '#a6e07c');
+  } else {
+    player.hunger = Math.min(MAX_HUNGER, player.hunger + kind.food);
+    foodEaten++;
+    floatText(it.x, it.y - 8, '+' + kind.food, '#ffd27a');
+  }
+}
+
+function rivalEats(it) {
+  removeItem(it);
+  burst(it.x, it.y, Object.values(ITEMS[it.type].colors), 6);
+  floatText(it.x, it.y - 8, 'NOM', '#b39a88');
+}
+
+function hurt(amount, cause, quiet = false) {
+  if (state === 'dead') return;
+  player.health = Math.max(0, player.health - amount);
+  if (!quiet) {
+    shake = 0.2;
+    floatText(player.x, player.y - 12, '-' + amount, '#ff6b81');
+  }
+  if (player.health === 0) {
+    state = 'dead';
+    deathCause = cause;
+    deadTime = 0;
+  }
 }
 
 // "Marine snow": bits of debris drifting down through the water
@@ -495,13 +830,18 @@ for (let i = 0; i < 90; i++) {
   });
 }
 
-let time = 0;
-
 // =====================================================================
 //  UPDATE: move everything a tiny step forward in time
 // =====================================================================
 function update(dt) {
+  clock += dt;
+  updateEffects(dt);
+  if (state === 'dead') {
+    deadTime += dt;
+    return;
+  }
   time += dt;
+  gatherItems();
 
   // --- You ---
   let dx = 0, dy = 0;
@@ -511,25 +851,55 @@ function update(dt) {
   if (keys['d'] || keys['arrowright']) dx += 1;
   if (dx || dy) {
     const len = Math.hypot(dx, dy); // so diagonal movement isn't faster
-    player.x += dx / len * player.speed * dt;
-    player.y += dy / len * player.speed * dt;
+    player.x += dx / len * PLAYER_SPEED * dt;
+    player.y += dy / len * PLAYER_SPEED * dt;
     player.angle = turnToward(player.angle, Math.atan2(dy, dx), dt * 10);
     player.walk += dt * 10;
-    hint.style.opacity = 0;
+    hasMoved = true;
+  }
+  if (hasMoved) hintTimer += dt;
+
+  // --- Hunger, healing and sickness ---
+  player.hunger = Math.max(0, player.hunger - HUNGER_DRAIN * dt);
+  if (player.hunger === 0) hurt(STARVE_DAMAGE * dt, 'starved', true);
+  else if (player.hunger > WELL_FED) player.health = Math.min(MAX_HEALTH, player.health + HEAL_RATE * dt);
+  player.sick = Math.max(0, player.sick - SICK_RECOVERY * dt);
+  const clearVision = BASE_VISION * (1 - SICK_VISION_LOSS * player.sick / 100);
+  visionRadius += (clearVision - visionRadius) * Math.min(1, dt * 3);
+
+  // --- You eat whatever you crawl over (careful!) ---
+  for (const it of activeItems) {
+    if (!it.gone && Math.hypot(it.x - player.x, it.y - player.y) < EAT_RADIUS) playerEats(it);
   }
 
   // --- Rival isopods ---
   spawnTimer -= dt;
-  if (spawnTimer <= 0 && rivals.length < MAX_RIVALS) {
+  const rivalLimit = Math.min(MAX_RIVALS, START_RIVALS + Math.floor(time / MORE_RIVALS_EVERY));
+  if (spawnTimer <= 0 && rivals.length < rivalLimit) {
     spawnRival();
     spawnTimer = SPAWN_EVERY;
   }
   for (const r of rivals) {
-    const dist = Math.hypot(player.x - r.x, player.y - r.y);
-    // Head your way, weaving a little as if sniffing around (less so up close)
-    const weave = Math.sin(time * 1.3 + r.wander) * Math.min(0.7, dist / 150);
-    r.angle = turnToward(r.angle, Math.atan2(player.y - r.y, player.x - r.x) + weave, dt * 3);
-    if (dist > BODY_RADIUS * 2 + 1) {
+    if (r.munching > 0) { // busy eating
+      r.munching -= dt;
+      continue;
+    }
+    // Go after whichever is closer: you, or a scrap of food they can smell
+    let target = player, dist = Math.hypot(player.x - r.x, player.y - r.y);
+    for (const it of activeItems) {
+      if (it.gone || !ITEMS[it.type].food) continue;
+      const d = Math.hypot(it.x - r.x, it.y - r.y);
+      if (d < RIVAL_SMELL && d < dist) { target = it; dist = d; }
+    }
+    if (target !== player && dist < EAT_RADIUS) {
+      rivalEats(target);
+      r.munching = 1.2;
+      continue;
+    }
+    // Weave a little as if sniffing around (less so up close)
+    const weave = Math.sin(clock * 1.3 + r.wander) * Math.min(0.7, dist / 150);
+    r.angle = turnToward(r.angle, Math.atan2(target.y - r.y, target.x - r.x) + weave, dt * 3);
+    if (target !== player || dist > BODY_RADIUS * 2 + 1) {
       r.x += Math.cos(r.angle) * r.speed * dt;
       r.y += Math.sin(r.angle) * r.speed * dt;
       r.walk += dt * r.speed * 0.25;
@@ -544,37 +914,129 @@ function update(dt) {
     if (Math.hypot(rivals[i].x - player.x, rivals[i].y - player.y) > GIVE_UP_DISTANCE) rivals.splice(i, 1);
   }
 
-  // --- Marine snow ---
+  // --- Bites ---
+  player.hurtTimer -= dt;
+  if (player.hurtTimer <= 0) {
+    for (const r of rivals) {
+      if (r.munching <= 0 && Math.hypot(r.x - player.x, r.y - player.y) < BODY_RADIUS * 2 + 2) {
+        hurt(BITE_DAMAGE, 'bitten');
+        player.hurtTimer = BITE_COOLDOWN;
+        break;
+      }
+    }
+  }
+
+  // --- Food gives off a scent that drifts with the current ---
+  for (const it of activeItems) {
+    if (!it.gone && ITEMS[it.type].food && Math.random() < dt * 2.5) {
+      scent.push({ x: it.x + Math.random() * 4 - 2, y: it.y + Math.random() * 4 - 2, sway: Math.random() * TAU, life: SCENT_LIFE });
+    }
+  }
+}
+
+// Crumbs, floating text, scent and snow keep moving even after you die
+function updateEffects(dt) {
+  for (const p of particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 1 - Math.min(1, 4 * dt);
+    p.vy *= 1 - Math.min(1, 4 * dt);
+    p.life -= dt;
+  }
+  for (const f of floaters) {
+    f.y -= 12 * dt;
+    f.life -= dt;
+  }
+  for (const s of scent) {
+    s.x += (CURRENT.x + Math.sin(clock * 2 + s.sway) * 3) * dt;
+    s.y += CURRENT.y * dt;
+    s.life -= dt;
+  }
+  for (const list of [particles, floaters, scent]) {
+    for (let i = list.length - 1; i >= 0; i--) if (list[i].life <= 0) list.splice(i, 1);
+  }
   for (const s of snow) {
     s.y += s.fall * dt;
-    s.x += Math.sin(time * 0.8 + s.sway) * 2 * dt;
+    s.x += Math.sin(clock * 0.8 + s.sway) * 2 * dt;
   }
+  shake = Math.max(0, shake - dt);
+  // The white "just lost" part of the health bar catches up after a moment
+  displayHealth = displayHealth > player.health ? Math.max(player.health, displayHealth - 25 * dt) : player.health;
 }
 
 // =====================================================================
 //  DRAW: paint the screen
 // =====================================================================
+function drawBar(x, y, value, max, [color, shine], warn, ghost = 0) {
+  const w = 50, h = 4;
+  ctx.fillStyle = '#04060a';
+  ctx.fillRect(x - 1, y - 1, w + 2, h + 2);
+  ctx.fillStyle = warn && Math.floor(clock * 4) % 2 === 0 ? '#6a1a28' : '#1b2330'; // flashes red when low
+  ctx.fillRect(x, y, w, h);
+  if (ghost > value) {
+    ctx.fillStyle = '#e8eef4';
+    ctx.fillRect(x, y, Math.round(w * ghost / max), h);
+  }
+  const fill = Math.round(w * value / max);
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, fill, h);
+  ctx.fillStyle = shine;
+  ctx.fillRect(x, y, fill, 1);
+}
+
+function drawHUD(W) {
+  ctx.drawImage(ICONS.heart, 4, 4);
+  drawBar(14, 5, player.health, MAX_HEALTH, ['#e84a64', '#ff9aab'], player.health < MAX_HEALTH * 0.25, displayHealth);
+  ctx.drawImage(ICONS.fish, 3, 13);
+  drawBar(14, 14, player.hunger, MAX_HUNGER, ['#f2a33a', '#ffd27a'], player.hunger < MAX_HUNGER * 0.2);
+  if (player.sick > 0) {
+    ctx.drawImage(ICONS.skull, 4, 21);
+    drawBar(14, 23, player.sick, 100, ['#6fbf4a', '#b8ec98'], false);
+  }
+  drawLabel(formatTime(time), Math.floor(W / 2), 4, '#dfe8f0', 1, true);
+}
+
 function draw() {
   const W = canvas.width, H = canvas.height;
-  const cx = Math.floor(W / 2), cy = Math.floor(H / 2);
-  // The camera keeps you in the middle of the screen
-  const camX = Math.round(player.x) - cx, camY = Math.round(player.y) - cy;
+  // The camera keeps you in the middle of the screen (and shakes when you're bitten)
+  let camX = Math.round(player.x) - Math.floor(W / 2), camY = Math.round(player.y) - Math.floor(H / 2);
+  if (shake > 0) {
+    camX += Math.round(Math.random() * 4 - 2);
+    camY += Math.round(Math.random() * 4 - 2);
+  }
+  const px = Math.round(player.x) - camX, py = Math.round(player.y) - camY; // you, on screen
 
   // Seabed: every chunk that's on screen
   for (let gy = Math.floor(camY / CHUNK); gy <= Math.floor((camY + H) / CHUNK); gy++) {
     for (let gx = Math.floor(camX / CHUNK); gx <= Math.floor((camX + W) / CHUNK); gx++) {
-      ctx.drawImage(getChunk(gx, gy), gx * CHUNK - camX, gy * CHUNK - camY);
+      ctx.drawImage(getChunk(gx, gy).canvas, gx * CHUNK - camX, gy * CHUNK - camY);
     }
   }
   forgetFarChunks();
 
-  // Rivals, then you on top
+  // Food and plastic
+  for (const it of activeItems) {
+    if (it.gone) continue;
+    const s = ITEMS[it.type].sprite;
+    ctx.drawImage(s, Math.round(it.x) - camX - ((s.width - 1) >> 1), Math.round(it.y) - camY - ((s.height - 1) >> 1));
+  }
+
+  // Crumbs
+  for (const p of particles) {
+    ctx.fillStyle = p.color;
+    ctx.fillRect(Math.round(p.x) - camX, Math.round(p.y) - camY, 1, 1);
+  }
+
+  // Rivals, then you on top (blinking for a moment after a bite)
   for (const r of rivals) {
     const s = pickSprite(rivalSprites, r.angle, r.walk);
     ctx.drawImage(s, Math.round(r.x) - camX - s.width / 2, Math.round(r.y) - camY - s.height / 2);
   }
-  const ps = pickSprite(playerSprites, player.angle, player.walk);
-  ctx.drawImage(ps, cx - ps.width / 2, cy - ps.height / 2);
+  const blinking = state === 'playing' && player.hurtTimer > 0 && Math.floor(player.hurtTimer * 15) % 2 === 1;
+  if (!blinking) {
+    const ps = pickSprite(playerSprites, player.angle, player.walk);
+    ctx.drawImage(ps, px - ps.width / 2, py - ps.height / 2);
+  }
 
   // Marine snow
   for (const s of snow) {
@@ -584,18 +1046,58 @@ function draw() {
 
   // Darkness: you can only see a circle around yourself
   const mask = getDarkMask();
-  const mx = cx - mask.width / 2, my = cy - mask.height / 2;
+  const mx = px - mask.width / 2, my = py - mask.height / 2;
   ctx.drawImage(mask, mx, my);
-  ctx.fillStyle = DARK_FILL;
+  ctx.fillStyle = darkFill;
   ctx.fillRect(0, 0, W, my);                                           // above the circle
   ctx.fillRect(0, my + mask.height, W, H - my - mask.height);          // below
   ctx.fillRect(0, my, mx, mask.height);                                // left
   ctx.fillRect(mx + mask.width, my, W - mx - mask.width, mask.height); // right
+
+  // Scent drifting off food: you can smell it before you can see it
+  for (const s of scent) {
+    const alpha = 0.45 * Math.min(1, s.life / 1.5, (SCENT_LIFE - s.life) * 2);
+    ctx.fillStyle = `rgba(214, 232, 150, ${alpha})`;
+    ctx.fillRect(Math.round(s.x) - camX, Math.round(s.y) - camY, 1, 1);
+  }
+
+  // Floating "+12", "BLEH!" and so on
+  for (const f of floaters) {
+    ctx.globalAlpha = Math.min(1, f.life * 3);
+    drawLabel(f.text, Math.round(f.x) - camX, Math.round(f.y) - camY, f.color, 1, true);
+  }
+  ctx.globalAlpha = 1;
+
+  drawHUD(W);
+
+  const cx = Math.floor(W / 2), cy = Math.floor(H / 2);
+  if (state === 'playing') {
+    // How-to-play hint, fading away once you've been crawling a while
+    const alpha = hasMoved ? Math.max(0, Math.min(1, 1 - (hintTimer - 6) / 2)) : 1;
+    if (alpha > 0) {
+      ctx.globalAlpha = alpha;
+      drawLabel('WASD / ARROW KEYS TO CRAWL', cx, H - 24, '#c9d6e3', 1, true);
+      drawLabel('EAT SCRAPS. AVOID PLASTIC!', cx, H - 15, '#c9d6e3', 1, true);
+      ctx.globalAlpha = 1;
+    }
+  } else {
+    // Game over
+    ctx.fillStyle = `rgba(0, 0, 0, ${Math.min(0.6, deadTime)})`;
+    ctx.fillRect(0, 0, W, H);
+    const title = deathCause === 'starved' ? 'YOU STARVED' : 'THE RIVALS GOT YOU';
+    drawLabel(title, cx, cy - 34, '#ff8a9c', 2, true);
+    drawLabel('SURVIVED ' + formatTime(time), cx, cy - 12, '#dfe8f0', 1, true);
+    drawLabel('ATE ' + foodEaten + ' SCRAPS AND ' + plasticEaten + ' PLASTIC', cx, cy - 4, '#dfe8f0', 1, true);
+    if (deadTime > 0.8 && Math.floor(clock * 2) % 2 === 0) {
+      drawLabel('PRESS SPACE TO TRY AGAIN', cx, cy + 14, '#ffffff', 1, true);
+    }
+  }
 }
 
 // =====================================================================
 //  THE GAME LOOP: update, draw, repeat ~60 times per second
 // =====================================================================
+resetGame();
 let last = performance.now();
 function loop(now) {
   const dt = Math.min((now - last) / 1000, 0.05); // seconds since the last frame

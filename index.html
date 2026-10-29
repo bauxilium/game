@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Isopod</title>
+<link href="https://fonts.googleapis.com/css2?family=Silkscreen&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; image-rendering: pixelated; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 32px;
+    text-align: center; color: #c9d6e3; opacity: 0.7;
+    font: 16px 'Silkscreen', monospace; letter-spacing: 1px;
+    pointer-events: none; transition: opacity 2s;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hint">WASD / arrow keys to crawl</div>
+<script>
+// =====================================================================
+//  SETUP
+// =====================================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const hint = document.getElementById('hint');
+
+// Pixel art trick: the game is drawn on a small, low-resolution canvas,
+// and the browser blows it up so every game pixel becomes a chunky block.
+const PIXEL_SIZE = 3; // each game pixel is about 3x3 screen pixels
+
+function resize() {
+  // Round to whole device pixels so every block is exactly the same size
+  const dpr = window.devicePixelRatio || 1;
+  const scale = Math.max(1, Math.round(PIXEL_SIZE * dpr));
+  canvas.width = Math.ceil(innerWidth * dpr / scale);
+  canvas.height = Math.ceil(innerHeight * dpr / scale);
+  canvas.style.width = canvas.width * scale / dpr + 'px';
+  canvas.style.height = canvas.height * scale / dpr + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+const TAU = Math.PI * 2; // a full circle, in radians
+
+// Turn a colour like '#a1b2c3' into [red, green, blue, alpha] numbers
+function rgb(hex, alpha = 255) {
+  const n = parseInt(hex.slice(1), 16);
+  return [n >> 16, (n >> 8) & 255, n & 255, alpha];
+}
+
+// A 4x4 pattern for "dithering": mixing two colours in a checkered pattern
+// to fake the colour in between. A classic pixel-art technique.
+const BAYER = [
+  [0, 8, 2, 10],
+  [12, 4, 14, 6],
+  [3, 11, 1, 9],
+  [15, 7, 13, 5],
+].map(row => row.map(v => v / 16));
+
+function mod(a, n) {
+  return ((a % n) + n) % n;
+}
+
+// Rotate an angle a fraction of the way toward a target angle, the short way round
+function turnToward(angle, target, amount) {
+  const diff = Math.atan2(Math.sin(target - angle), Math.cos(target - angle));
+  return angle + diff * Math.min(1, amount);
+}
+
+// =====================================================================
+//  KEYBOARD
+// =====================================================================
+const keys = {};
+addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+// Don't keep walking if the window loses focus while a key is held
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+// =====================================================================
+//  ISOPOD SPRITES
+//  Rather than hand-placing every pixel, each kind of isopod is described
+//  by a "look" (body shape, colours, legs...). The code paints it pixel by
+//  pixel, facing 32 different directions, each with 4 walking frames.
+//
+//  Positions in a look are measured along the body: u = forward/back
+//  from the middle (head is +), v = out to the side.
+// =====================================================================
+const SPRITE_ANGLES = 32;
+const WALK_FRAMES = 4;
+const SPRITE_SHADOW = [0, 0, 0, 90];
+
+const PLAYER_LOOK = {
+  size: 28,                          // sprite canvas size in pixels
+  length: 7, width: 5.5,             // half-length and half-width of the body
+  roundness: 2.4,                    // 2 = plain oval, higher = chubbier
+  plates: [2.6, 0.2, -2.2, -4.6],    // grooves between armour plates (the first is the neck)
+  spikes: 0,                         // how jagged the plate edges are
+  legs: 4, legStart: 2.4, legGap: 2.4, legLength: 2.2, legSwing: 0.9, legSpread: 0.8,
+  antenna: [[5.6, 1.2], [8.8, 2.8], [10, 2.3]],
+  tail: [[-6.2, 1.4], [-8.2, 2.0]],
+  eye: { u: 4.4, v: 2.4, big: true },
+  blush: { u: 3.4, v: 3.9 },
+  shine: true,
+  colors: {
+    outline: rgb('#2a1d36'), shadow: rgb('#8b78a6'), base: rgb('#b7a4cf'), head: rgb('#b7a4cf'),
+    light: rgb('#d5c8e6'), shine: rgb('#f3eefa'), groove: rgb('#9b88b6'), legs: rgb('#6c5a80'),
+    eye: rgb('#1b1024'), eyeShine: rgb('#ffffff'), blush: rgb('#f19bb5'),
+  },
+};
+
+const RIVAL_LOOK = {
+  size: 40,
+  length: 8.5, width: 4.8,
+  roundness: 2.2,
+  plates: [5.6, 3.6, 1.6, -0.4, -2.4, -4.4, -6.4],
+  spikes: 1.1,
+  legs: 7, legStart: 4.6, legGap: 1.8, legLength: 3.4, legSwing: 1.2, legSpread: 2,
+  antenna: [[7.2, 1.0], [10.2, 3.2], [12.2, 3.6]],
+  tail: [[-7.2, 1.6], [-10.2, 3.2]],
+  eye: { u: 6.4, v: 1.7, big: false },
+  blush: null,
+  shine: false,
+  colors: {
+    outline: rgb('#17110e'), shadow: rgb('#463730'), base: rgb('#6a5649'), head: rgb('#4f3f37'),
+    light: rgb('#86705f'), shine: rgb('#9a8270'), groove: rgb('#54443b'), legs: rgb('#66534a'),
+    eye: rgb('#ffd23f'), eyeShine: rgb('#ffd23f'), blush: null,
+  },
+};
+
+// How wide the body is at point u along it (-1 means "not part of the body")
+function bodyHalfWidth(look, u) {
+  const t = Math.abs(u) / look.length;
+  if (t >= 1) return -1;
+  let w = look.width * Math.pow(1 - Math.pow(t, look.roundness), 1 / look.roundness);
+  // Jagged edge: each armour plate flares out toward its back corner
+  const p = look.plates;
+  for (let k = 0; k < p.length - 1; k++) {
+    if (u <= p[k] && u > p[k + 1]) {
+      const f = (p[k] - u) / (p[k] - p[k + 1]);
+      w += look.spikes * f * f;
+    }
+  }
+  return w;
+}
+
+// Draw a 1-pixel-wide straight line between two pixels
+function drawLine([x0, y0], [x1, y1], color, plot) {
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy;
+  while (true) {
+    plot(x0, y0, color);
+    if (x0 === x1 && y0 === y1) return;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+function makeIsopodSprite(look, angle, frame) {
+  const S = look.size, half = S / 2, C = look.colors;
+  const cos = Math.cos(angle), sin = Math.sin(angle);
+  // Convert between sprite pixels (x, y) and body positions (u, v)
+  const toBody = (x, y) => [(x - half) * cos + (y - half) * sin, -(x - half) * sin + (y - half) * cos];
+  const toPoint = (u, v) => [half + u * cos - v * sin, half + u * sin + v * cos];
+  const toPixel = (u, v) => toPoint(u, v).map(Math.floor);
+  const inBody = (x, y) => { const [u, v] = toBody(x, y); return Math.abs(v) <= bodyHalfWidth(look, u); };
+
+  const px = new Array(S * S).fill(null); // one colour (or null = see-through) per pixel
+  const get = (x, y) => (x >= 0 && y >= 0 && x < S && y < S) ? px[y * S + x] : null;
+  const set = (x, y, c) => { if (x >= 0 && y >= 0 && x < S && y < S) px[y * S + x] = c; };
+  const setIfEmpty = (x, y, c) => { if (!get(x, y)) set(x, y, c); };
+
+  // 1. The body, lit from the top-left of the screen
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const cx = x + 0.5, cy = y + 0.5;
+      if (!inBody(cx, cy)) continue;
+      const u = toBody(cx, cy)[0];
+      let c = u > look.plates[0] ? C.head : C.base;
+      if (!inBody(cx + 1.6, cy + 1.6)) c = C.shadow;                         // edge facing away from the light
+      else if (look.plates.some(p => Math.abs(u - p) < 0.45)) c = C.groove;  // gaps between armour plates
+      else if (!inBody(cx - 1.2, cy - 1.2)) c = C.light;                     // edge facing the light
+      else if (look.shine && Math.hypot(cx - half + 2, cy - half + 2) < 1.3) c = C.shine;
+      set(x, y, c);
+    }
+  }
+
+  // 2. A dark outline hugging the body
+  const body = px.slice();
+  const solid = (x, y) => x >= 0 && y >= 0 && x < S && y < S && body[y * S + x];
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      if (!body[y * S + x] && (solid(x - 1, y) || solid(x + 1, y) || solid(x, y - 1) || solid(x, y + 1))) {
+        set(x, y, C.outline);
+      }
+    }
+  }
+
+  // 3. Thin legs, antennae and tail. The legs swing a little each walking frame.
+  const step = frame / WALK_FRAMES * TAU;
+  const limb = (points, c) => {
+    for (let i = 0; i < points.length - 1; i++) drawLine(toPixel(...points[i]), toPixel(...points[i + 1]), c, setIfEmpty);
+  };
+  for (const side of [-1, 1]) {
+    for (let i = 0; i < look.legs; i++) {
+      const u = look.legStart - i * look.legGap;
+      const w = bodyHalfWidth(look, u);
+      const swing = Math.sin(step + i * 1.6 + (side > 0 ? Math.PI : 0)) * look.legSwing;
+      const tipU = u + swing + u / look.length * look.legSpread;
+      limb([[u, side * (w - 0.5)], [tipU, side * (w + look.legLength)]], C.legs);
+    }
+    limb(look.antenna.map(([u, v]) => [u, side * v]), C.legs);
+    limb(look.tail.map(([u, v]) => [u, side * v]), C.legs);
+  }
+
+  // 4. Rosy cheeks (cute only) and eyes: big and shiny, or small and beady
+  for (const side of [-1, 1]) {
+    if (look.blush) set(...toPixel(look.blush.u, side * look.blush.v), C.blush);
+    if (look.eye.big) {
+      const [ex, ey] = toPoint(look.eye.u, side * look.eye.v);
+      const x0 = Math.round(ex - 1), y0 = Math.round(ey - 1);
+      set(x0, y0, C.eyeShine); set(x0 + 1, y0, C.eye);
+      set(x0, y0 + 1, C.eye);  set(x0 + 1, y0 + 1, C.eye);
+    } else {
+      set(...toPixel(look.eye.u, side * look.eye.v), C.eye);
+    }
+  }
+
+  // 5. A soft shadow on the seabed, down and to the right
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      if (!px[y * S + x] && inBody(x + 0.5 - 2, y + 0.5 - 2.5)) px[y * S + x] = SPRITE_SHADOW;
+    }
+  }
+
+  // Copy the pixels onto a little canvas we can stamp onto the screen
+  const sprite = document.createElement('canvas');
+  sprite.width = sprite.height = S;
+  const sctx = sprite.getContext('2d');
+  const img = sctx.createImageData(S, S);
+  px.forEach((c, i) => { if (c) img.data.set(c, i * 4); });
+  sctx.putImageData(img, 0, 0);
+  return sprite;
+}
+
+function makeSprites(look) {
+  const sprites = [];
+  for (let a = 0; a < SPRITE_ANGLES; a++) {
+    sprites.push([]);
+    for (let f = 0; f < WALK_FRAMES; f++) sprites[a].push(makeIsopodSprite(look, a / SPRITE_ANGLES * TAU, f));
+  }
+  return sprites;
+}
+
+// Pick the pre-drawn sprite closest to the direction it's facing
+function pickSprite(sprites, angle, walk) {
+  const a = Math.round(mod(angle, TAU) / TAU * SPRITE_ANGLES) % SPRITE_ANGLES;
+  return sprites[a][Math.floor(walk) % WALK_FRAMES];
+}
+
+const playerSprites = makeSprites(PLAYER_LOOK);
+const rivalSprites = makeSprites(RIVAL_LOOK);
+
+// =====================================================================
+//  ENDLESS SEABED
+//  The world is split into square "chunks". A chunk is only created when
+//  it comes into view, so the seabed goes on forever. Each chunk is built
+//  from a seed, so a spot looks the same when you come back to it.
+// =====================================================================
+const CHUNK = 128;                              // chunk size in game pixels
+const SEED = Math.floor(Math.random() * 1e9);   // a different seabed every game
+const chunks = new Map();
+
+// A repeatable "random" number from 0 to 1 for any whole-number position
+function hash(x, y, salt) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(SEED + salt, 1442695041)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// Smooth random bumps, used for patches of lighter and darker silt
+function smoothNoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  let fx = x - xi, fy = y - yi;
+  fx = fx * fx * (3 - 2 * fx);
+  fy = fy * fy * (3 - 2 * fy);
+  const a = hash(xi, yi, 0), b = hash(xi + 1, yi, 0), c = hash(xi, yi + 1, 0), d = hash(xi + 1, yi + 1, 0);
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+
+// A random number generator that always gives the same sequence for the same seed
+function seededRandom(seed) {
+  return () => {
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const SILT = ['#121a23', '#16202a', '#1a2531', '#1f2b38', '#25323f'].map(c => rgb(c));
+const GRAIN_LIGHT = rgb('#33435a'), GRAIN_DARK = rgb('#0c1218');
+const HOLE = rgb('#06090d'), HOLE_LIP = rgb('#2c3a49');
+const ROCKS = [ // [shadow, base, lit] colours for each kind of stone
+  ['#1e2731', '#2b3642', '#3c4957'],
+  ['#25232a', '#35323a', '#4a4650'],
+  ['#2a3138', '#3b444d', '#56616c'],
+].map(set => set.map(c => rgb(c)));
+
+function makeChunk(cx, cy) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = CHUNK;
+  const c = canvas.getContext('2d');
+  const img = c.createImageData(CHUNK, CHUNK);
+  const data = img.data;
+  const inside = (x, y) => x >= 0 && y >= 0 && x < CHUNK && y < CHUNK;
+  const put = (x, y, col) => { if (inside(x, y)) data.set(col, (y * CHUNK + x) * 4); };
+  const darken = (x, y, f) => {
+    if (!inside(x, y)) return;
+    const i = (y * CHUNK + x) * 4;
+    data[i] *= f; data[i + 1] *= f; data[i + 2] *= f;
+  };
+
+  // Silt: smooth patches of lighter and darker mud, dithered into a few colours
+  for (let y = 0; y < CHUNK; y++) {
+    for (let x = 0; x < CHUNK; x++) {
+      const wx = cx * CHUNK + x, wy = cy * CHUNK + y; // position in the whole world
+      let n = 0.65 * smoothNoise(wx / 90, wy / 90) + 0.35 * smoothNoise(wx / 26 + 500, wy / 26 + 500);
+      n = Math.min(1, Math.max(0, (n - 0.5) * 1.8 + 0.5));
+      const level = Math.min(SILT.length - 1, Math.floor(n * (SILT.length - 1) + BAYER[wy & 3][wx & 3]));
+      let col = SILT[level];
+      const grain = hash(wx, wy, 1);
+      if (grain < 0.012) col = GRAIN_LIGHT;
+      else if (grain > 0.994) col = GRAIN_DARK;
+      put(x, y, col);
+    }
+  }
+
+  const rand = seededRandom(Math.floor(hash(cx, cy, 2) * 4294967296));
+  const between = (lo, hi) => lo + rand() * (hi - lo);
+  const spot = margin => [Math.floor(between(margin, CHUNK - margin)), Math.floor(between(margin, CHUNK - margin))];
+
+  // A stone lit from the top-left, casting a small shadow down-right
+  const stone = (x0, y0, r, squash, colors) => {
+    const solid = (dx, dy) => dx * dx + (dy * dy) / (squash * squash) <= r * r;
+    const R = Math.ceil(r) + 1;
+    for (let dy = -R; dy <= R; dy++) {
+      for (let dx = -R; dx <= R; dx++) {
+        if (solid(dx, dy)) {
+          let col = colors[1];
+          if (!solid(dx + 1, dy + 1)) col = colors[0];
+          else if (!solid(dx - 1, dy - 1)) col = colors[2];
+          put(x0 + dx, y0 + dy, col);
+        } else if (solid(dx - 1, dy - 1)) {
+          darken(x0 + dx, y0 + dy, 0.55);
+        }
+      }
+    }
+  };
+
+  // A burrow hole dug by some unseen worm, with a little lip of mud
+  const hole = (x0, y0) => {
+    const open = (dx, dy) => dx * dx / 4 + dy * dy / 1.6 <= 1;
+    for (let dy = -3; dy <= 3; dy++) {
+      for (let dx = -4; dx <= 4; dx++) {
+        if (open(dx, dy)) put(x0 + dx, y0 + dy, HOLE);
+        else if (open(dx - 1, dy - 1)) put(x0 + dx, y0 + dy, HOLE_LIP);
+      }
+    }
+  };
+
+  const pickRock = () => ROCKS[Math.floor(rand() * ROCKS.length)];
+
+  if (rand() < 0.3) hole(...spot(6));
+  if (rand() < 0.25) { // a little cluster of stones
+    const [x, y] = spot(16);
+    for (let i = 0; i < 8; i++) {
+      stone(x + Math.round(between(-10, 10)), y + Math.round(between(-10, 10)), between(1, 2.5), between(0.65, 1), pickRock());
+    }
+  }
+  const pebbles = 3 + Math.floor(rand() * 6);
+  for (let i = 0; i < pebbles; i++) {
+    stone(...spot(6), between(1, 3.5), between(0.65, 1), pickRock());
+  }
+
+  c.putImageData(img, 0, 0);
+  return { canvas, cx, cy };
+}
+
+function getChunk(cx, cy) {
+  const key = cx + ',' + cy;
+  if (!chunks.has(key)) chunks.set(key, makeChunk(cx, cy));
+  return chunks.get(key).canvas;
+}
+
+// Forget chunks far behind you so memory doesn't fill up
+function forgetFarChunks() {
+  const keep = Math.ceil(Math.max(canvas.width, canvas.height) / CHUNK) + 2;
+  if (chunks.size <= (keep * 2 + 1) ** 2) return;
+  const pcx = Math.floor(player.x / CHUNK), pcy = Math.floor(player.y / CHUNK);
+  for (const [key, ch] of chunks) {
+    if (Math.abs(ch.cx - pcx) > keep || Math.abs(ch.cy - pcy) > keep) chunks.delete(key);
+  }
+}
+
+// =====================================================================
+//  DARKNESS
+//  A dark layer with a hole around the player. The edge fades out in
+//  dithered steps for a pixel-art look. It's only rebuilt when the
+//  vision size changes.
+// =====================================================================
+const DARK_STEPS = [0, 0.24, 0.48, 0.72, 0.96]; // see-through ... almost black
+const DARK_FILL = `rgba(0, 2, 8, ${Math.round(0.96 * 255) / 255})`;
+let darkMask = null, darkMaskRadius = -1;
+
+function getDarkMask() {
+  const r = Math.round(visionRadius);
+  if (r === darkMaskRadius) return darkMask;
+  const half = r + 1, size = half * 2;
+  darkMask = document.createElement('canvas');
+  darkMask.width = darkMask.height = size;
+  const mctx = darkMask.getContext('2d');
+  const img = mctx.createImageData(size, size);
+  const inner = r * 0.3; // fully lit inside this
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const d = Math.hypot(x + 0.5 - half, y + 0.5 - half);
+      const t = Math.min(1, Math.max(0, (d - inner) / (r - inner)));
+      const step = Math.min(DARK_STEPS.length - 1, Math.floor(t * (DARK_STEPS.length - 1) + BAYER[y & 3][x & 3]));
+      img.data.set([0, 2, 8, Math.round(DARK_STEPS[step] * 255)], (y * size + x) * 4);
+    }
+  }
+  mctx.putImageData(img, 0, 0);
+  darkMaskRadius = r;
+  return darkMask;
+}
+
+// =====================================================================
+//  THE PLAYER, RIVALS AND DRIFTING SNOW
+//  (all distances are in game pixels)
+// =====================================================================
+const player = {
+  x: 0, y: 0,
+  speed: 50,            // pixels per second
+  angle: -Math.PI / 2,  // facing up
+  walk: 0,              // drives the walking animation
+};
+
+// How far you can see. Getting sick will shrink this later.
+let visionRadius = 87;
+
+const BODY_RADIUS = 7;        // isopods are treated as circles this big when bumping
+const MAX_RIVALS = 25;
+const SPAWN_EVERY = 1.2;      // seconds between new rivals
+const GIVE_UP_DISTANCE = 450; // rivals left this far behind wander off
+const rivals = [];
+let spawnTimer = 2;           // a short calm moment at the start
+
+function spawnRival() {
+  // Appear somewhere in the darkness just beyond what you can see
+  const dir = Math.random() * TAU;
+  const dist = visionRadius + 30 + Math.random() * 60;
+  rivals.push({
+    x: player.x + Math.cos(dir) * dist,
+    y: player.y + Math.sin(dir) * dist,
+    angle: dir + Math.PI,               // facing you
+    speed: 28 + Math.random() * 12,     // a bit slower than you
+    walk: Math.random() * WALK_FRAMES,
+    wander: Math.random() * 100,        // so they don't all weave in sync
+  });
+}
+
+// Push two overlapping bodies apart. `aShare` is how much of the push `a` takes.
+function pushApart(a, b, aShare) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const d = Math.hypot(dx, dy), overlap = BODY_RADIUS * 2 - d;
+  if (overlap <= 0 || d === 0) return;
+  const nx = dx / d, ny = dy / d;
+  a.x -= nx * overlap * aShare;       a.y -= ny * overlap * aShare;
+  b.x += nx * overlap * (1 - aShare); b.y += ny * overlap * (1 - aShare);
+}
+
+// "Marine snow": bits of debris drifting down through the water
+const snow = [];
+for (let i = 0; i < 90; i++) {
+  snow.push({
+    x: Math.random() * 2000, y: Math.random() * 2000,
+    fall: 2 + Math.random() * 5,
+    depth: 1.1 + Math.random() * 0.5, // floating above the floor, so it slides past a bit faster
+    sway: Math.random() * TAU,
+    bright: Math.random() < 0.3,
+  });
+}
+
+let time = 0;
+
+// =====================================================================
+//  UPDATE: move everything a tiny step forward in time
+// =====================================================================
+function update(dt) {
+  time += dt;
+
+  // --- You ---
+  let dx = 0, dy = 0;
+  if (keys['w'] || keys['arrowup'])    dy -= 1;
+  if (keys['s'] || keys['arrowdown'])  dy += 1;
+  if (keys['a'] || keys['arrowleft'])  dx -= 1;
+  if (keys['d'] || keys['arrowright']) dx += 1;
+  if (dx || dy) {
+    const len = Math.hypot(dx, dy); // so diagonal movement isn't faster
+    player.x += dx / len * player.speed * dt;
+    player.y += dy / len * player.speed * dt;
+    player.angle = turnToward(player.angle, Math.atan2(dy, dx), dt * 10);
+    player.walk += dt * 10;
+    hint.style.opacity = 0;
+  }
+
+  // --- Rival isopods ---
+  spawnTimer -= dt;
+  if (spawnTimer <= 0 && rivals.length < MAX_RIVALS) {
+    spawnRival();
+    spawnTimer = SPAWN_EVERY;
+  }
+  for (const r of rivals) {
+    const dist = Math.hypot(player.x - r.x, player.y - r.y);
+    // Head your way, weaving a little as if sniffing around (less so up close)
+    const weave = Math.sin(time * 1.3 + r.wander) * Math.min(0.7, dist / 150);
+    r.angle = turnToward(r.angle, Math.atan2(player.y - r.y, player.x - r.x) + weave, dt * 3);
+    if (dist > BODY_RADIUS * 2 + 1) {
+      r.x += Math.cos(r.angle) * r.speed * dt;
+      r.y += Math.sin(r.angle) * r.speed * dt;
+      r.walk += dt * r.speed * 0.25;
+    }
+  }
+  // Bodies can't overlap: rivals nudge each other aside, and you shove through them
+  for (let i = 0; i < rivals.length; i++) {
+    for (let j = i + 1; j < rivals.length; j++) pushApart(rivals[i], rivals[j], 0.5);
+    pushApart(player, rivals[i], 0);
+  }
+  for (let i = rivals.length - 1; i >= 0; i--) {
+    if (Math.hypot(rivals[i].x - player.x, rivals[i].y - player.y) > GIVE_UP_DISTANCE) rivals.splice(i, 1);
+  }
+
+  // --- Marine snow ---
+  for (const s of snow) {
+    s.y += s.fall * dt;
+    s.x += Math.sin(time * 0.8 + s.sway) * 2 * dt;
+  }
+}
+
+// =====================================================================
+//  DRAW: paint the screen
+// =====================================================================
+function draw() {
+  const W = canvas.width, H = canvas.height;
+  const cx = Math.floor(W / 2), cy = Math.floor(H / 2);
+  // The camera keeps you in the middle of the screen
+  const camX = Math.round(player.x) - cx, camY = Math.round(player.y) - cy;
+
+  // Seabed: every chunk that's on screen
+  for (let gy = Math.floor(camY / CHUNK); gy <= Math.floor((camY + H) / CHUNK); gy++) {
+    for (let gx = Math.floor(camX / CHUNK); gx <= Math.floor((camX + W) / CHUNK); gx++) {
+      ctx.drawImage(getChunk(gx, gy), gx * CHUNK - camX, gy * CHUNK - camY);
+    }
+  }
+  forgetFarChunks();
+
+  // Rivals, then you on top
+  for (const r of rivals) {
+    const s = pickSprite(rivalSprites, r.angle, r.walk);
+    ctx.drawImage(s, Math.round(r.x) - camX - s.width / 2, Math.round(r.y) - camY - s.height / 2);
+  }
+  const ps = pickSprite(playerSprites, player.angle, player.walk);
+  ctx.drawImage(ps, cx - ps.width / 2, cy - ps.height / 2);
+
+  // Marine snow
+  for (const s of snow) {
+    ctx.fillStyle = s.bright ? 'rgba(225, 238, 248, 0.7)' : 'rgba(200, 220, 235, 0.35)';
+    ctx.fillRect(mod(Math.round(s.x - camX * s.depth), W), mod(Math.round(s.y - camY * s.depth), H), 1, 1);
+  }
+
+  // Darkness: you can only see a circle around yourself
+  const mask = getDarkMask();
+  const mx = cx - mask.width / 2, my = cy - mask.height / 2;
+  ctx.drawImage(mask, mx, my);
+  ctx.fillStyle = DARK_FILL;
+  ctx.fillRect(0, 0, W, my);                                           // above the circle
+  ctx.fillRect(0, my + mask.height, W, H - my - mask.height);          // below
+  ctx.fillRect(0, my, mx, mask.height);                                // left
+  ctx.fillRect(mx + mask.width, my, W - mx - mask.width, mask.height); // right
+}
+
+// =====================================================================
+//  THE GAME LOOP: update, draw, repeat ~60 times per second
+// =====================================================================
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05); // seconds since the last frame
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
